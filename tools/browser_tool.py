@@ -60,6 +60,7 @@ import sys
 import tempfile
 import threading
 import time
+import httpx
 import requests
 from typing import Dict, Any, Optional, List
 from pathlib import Path
@@ -355,13 +356,18 @@ atexit.register(_stop_browser_cleanup_thread)
 BROWSER_TOOL_SCHEMAS = [
     {
         "name": "browser_navigate",
-        "description": "Navigate to a URL in the browser. Initializes the session and loads the page. Must be called before other browser tools. For simple information retrieval, prefer web_search or web_extract (faster, cheaper). Use browser tools when you need to interact with a page (click, fill forms, dynamic content).",
+        "description": "Navigate to a URL in the browser. Initializes the session and loads the page. Must be called before other browser tools. For simple information retrieval, prefer web_search or web_extract (faster, cheaper). Use browser tools when you need to interact with a page (click, fill forms, dynamic content). When a previous call returned read_only=true and you need to interact with the page, call again with interactive=true to launch a real browser session.",
         "parameters": {
             "type": "object",
             "properties": {
                 "url": {
                     "type": "string",
                     "description": "The URL to navigate to (e.g., 'https://example.com')"
+                },
+                "interactive": {
+                    "type": "boolean",
+                    "description": "Force a real browser session, skipping the markdown fast-path. Use when you need to interact with the page (click, type, etc.).",
+                    "default": False
                 }
             },
             "required": ["url"]
@@ -1001,19 +1007,95 @@ def _truncate_snapshot(snapshot_text: str, max_chars: int = 8000) -> str:
 # Browser Tool Functions
 # ============================================================================
 
-def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
+def _try_fetch_markdown(url: str) -> Optional[str]:
+    """Try to fetch markdown content directly via HTTP.
+
+    Uses a two-step strategy controlled by config:
+    1. ``Accept: text/markdown`` header (if ``browser.markdown_header`` is true)
+    2. Markdown provider proxy (if ``browser.markdown_provider`` is set)
+
+    Returns the markdown string on success, or ``None`` if neither method
+    produces markdown (so the caller should fall back to the browser).
+    """
+    from urllib.parse import urlparse
+
+    # Only allow HTTP(S) URLs to prevent SSRF via file://, ftp://, etc.
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        logger.debug("Markdown fast-path skipped: unsupported scheme %r", parsed.scheme)
+        return None
+
+    try:
+        from hermes_cli.config import load_config
+        browser_cfg = load_config().get("browser", {})
+    except Exception:
+        logger.debug("Markdown fast-path: config load failed, using defaults")
+        browser_cfg = {}
+
+    timeout = 10
+
+    # Step 1: try Accept: text/markdown header
+    if browser_cfg.get("markdown_header", True):
+        try:
+            resp = httpx.get(
+                url,
+                headers={"Accept": "text/markdown"},
+                timeout=timeout,
+                follow_redirects=True,
+            )
+            resp.raise_for_status()
+            if "text/markdown" in resp.headers.get("content-type", ""):
+                return resp.text
+        except (httpx.HTTPError, httpx.InvalidURL, OSError) as exc:
+            logger.debug("Markdown header probe failed for %s: %s", url, exc)
+
+    # Step 2: try markdown provider proxy
+    provider = browser_cfg.get("markdown_provider", "")
+    if provider:
+        # Ensure trailing slash so URL concatenation is well-formed
+        if not provider.endswith("/"):
+            provider += "/"
+        try:
+            resp = httpx.get(
+                f"{provider}{url}",
+                timeout=timeout,
+                follow_redirects=True,
+            )
+            resp.raise_for_status()
+            if resp.text.strip():
+                return resp.text
+        except (httpx.HTTPError, httpx.InvalidURL, OSError) as exc:
+            logger.debug("Markdown provider probe failed for %s: %s", url, exc)
+
+    return None
+
+
+def browser_navigate(url: str, task_id: Optional[str] = None, interactive: bool = False) -> str:
     """
     Navigate to a URL in the browser.
-    
+
     Args:
         url: The URL to navigate to
         task_id: Task identifier for session isolation
-        
+        interactive: If True, skip the markdown fast-path and launch a real
+                     browser session so the agent can interact with the page.
+
     Returns:
         JSON string with navigation result (includes stealth features info on first nav)
     """
+    # Fast-path: if the server returns clean markdown, skip the browser entirely.
+    # Skipped when interactive=True or when a live session already exists for
+    # this task (to avoid replacing an authenticated/stateful browser with
+    # anonymous markdown).
     effective_task_id = task_id or "default"
-    
+    has_session = effective_task_id in _active_sessions
+    md = None if (interactive or has_session) else _try_fetch_markdown(url)
+    if md is not None:
+        return json.dumps(
+            {"success": True, "url": url, "title": "", "markdown": md, "read_only": True},
+            ensure_ascii=False,
+        )
+
     # Get session info to check if this is a new session
     # (will create one with features logged if not exists)
     session_info = _get_session_info(effective_task_id)
@@ -1865,7 +1947,7 @@ registry.register(
     name="browser_navigate",
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_navigate"],
-    handler=lambda args, **kw: browser_navigate(url=args.get("url", ""), task_id=kw.get("task_id")),
+    handler=lambda args, **kw: browser_navigate(url=args.get("url", ""), task_id=kw.get("task_id"), interactive=args.get("interactive", False)),
     check_fn=check_browser_requirements,
 )
 registry.register(
